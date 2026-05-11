@@ -794,21 +794,80 @@ async def lira_cycle_update(body: _LiraOnboardingIn) -> _LiraGenericOut:
 
 @app.get("/v1/lira/status")
 async def lira_status() -> dict:
-    """Stub for the bundled chat UI's status check. Reports that the
-    chat backend is offline so the UI degrades gracefully."""
-    return {"online": False, "models": []}
+    """Status check used by the bundled chat UI. The original Fly backend
+    wrapped Pollinations.ai (free, no-API-key, OpenAI-compatible); we mirror
+    that here, so the chat bubble shows as online."""
+    return {"online": True, "models": ["openai"]}
+
+
+# System prompt mirrors the persona used by the bundled "Лира" assistant —
+# warm, supportive, focused on women's-health questions, falls back to a
+# soft handoff to the live operator (@lowerBsk24_bot) when out of scope.
+_LIRA_SYSTEM_PROMPT = (
+    "Ты — Лира 🌸, тёплая ассистентка по женскому здоровью и заботе о себе. "
+    "Отвечаешь на русском, кратко и по-доброму. Помогаешь с вопросами о "
+    "менструальном цикле, ПМС, овуляции, гигиене, питании, образе жизни и "
+    "эмоциональном состоянии. Если вопрос требует врача — мягко напомни, "
+    "что ты не заменяешь врача, и предложи обратиться к специалисту. "
+    "Не используешь медицинские диагнозы и не назначаешь лечение. "
+    "Если пользователь спрашивает про подписку, бокс или доставку — "
+    "предлагай написать оператору в Telegram @lowerBsk24_bot."
+)
 
 
 @app.post("/v1/lira/chat")
-async def lira_chat(body: _LiraOnboardingIn) -> dict:
-    """Stub for the bundled chat UI. Returns a polite refusal so the
-    UI shows the message rather than spinning forever."""
+async def lira_chat(payload: dict | None = None) -> dict:
+    """Proxy the bundled chat UI to Pollinations.ai (OpenAI-compatible,
+    free, no API key required). Accepts a flexible payload — the web
+    bundle has historically sent ``{messages:[…]}`` or ``{message:"…"}``."""
+    import httpx
+
+    payload = payload or {}
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        # Fallback: single-message shape used by older bundles.
+        user_text = (
+            payload.get("message")
+            or payload.get("text")
+            or payload.get("prompt")
+            or ""
+        )
+        messages = [{"role": "user", "content": str(user_text)}]
+
+    # Always prepend the persona system prompt (override caller's system
+    # message if any — the bundle doesn't send one).
+    msgs: list[dict] = [{"role": "system", "content": _LIRA_SYSTEM_PROMPT}]
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role") or "user"
+        content = m.get("content") or m.get("text") or ""
+        if role == "system":
+            continue
+        msgs.append({"role": role, "content": str(content)})
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                "https://text.pollinations.ai/openai",
+                json={"model": "openai", "messages": msgs},
+            )
+            r.raise_for_status()
+            data = r.json()
+        reply = data["choices"][0]["message"]["content"]
+    except Exception as e:  # noqa: BLE001
+        log.warning("lira-chat: pollinations failed: %s", e)
+        reply = (
+            "Кажется, я задумалась 🌸 Попробуй задать вопрос ещё раз через "
+            "минутку. Если срочно — пиши оператору в Telegram "
+            "@lowerBsk24_bot."
+        )
+
     return {
-        "reply": (
-            "Ассистент Lira временно недоступен. Я могу ответить тебе "
-            "напрямую в Telegram-боте @lowerBsk24_bot — там есть оператор."
-        ),
-        "online": False,
+        "reply": reply,
+        # OpenAI-compatible shape so any UI that expects either format works.
+        "choices": [{"message": {"role": "assistant", "content": reply}}],
+        "online": True,
     }
 
 
