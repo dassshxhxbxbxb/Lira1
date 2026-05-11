@@ -22,6 +22,7 @@ from datetime import timezone
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from bot.config import get_settings
@@ -123,6 +124,18 @@ app = FastAPI(
         "single deep-link tap."
     ),
     lifespan=lifespan,
+)
+
+# CORS — the Lira web bundle (served on devinapps.com) POSTs to /v1/lira/*
+# from the browser, which is a cross-origin request. Open it up to all
+# origins: the endpoints are notification-only and the data shipped is
+# self-reported (no auth tokens / no secret data to protect server-side).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
 )
 
 
@@ -360,6 +373,330 @@ async def pair_forecast(token: str, body: ForecastIn) -> ForecastOut:
             except Exception:  # pragma: no cover
                 log.exception("admin forecast notification failed")
     return ForecastOut(ok=True, stored=stored)
+
+
+# ---------------------------------------------------------------------- #
+# /v1/lira/* — web-app → bot notification bridge                            #
+# ---------------------------------------------------------------------- #
+#
+# The Lira web bundle posts to these endpoints from the browser when the
+# user finishes the in-app questionnaire (onboarding), completes a payment
+# (subscription), or her cycle forecast shifts by more than ±2 days
+# (cycle-update). Each endpoint formats the payload as an HTML message and
+# sends it to ``settings.admin_chat_id`` — i.e. the owner's Telegram chat.
+
+import json as _json  # noqa: E402  — local alias to avoid conflict
+from datetime import date as _date, timedelta as _timedelta  # noqa: E402
+
+
+class _LiraOnboardingIn(BaseModel):
+    """Strict-but-forgiving model: the web bundle may add extra keys; we
+    accept and forward whatever is sent, but never fail on schema drift."""
+
+    model_config = {"extra": "allow"}
+
+
+class _LiraGenericOut(BaseModel):
+    ok: bool = True
+
+
+def _format_iso_date(raw: str | None) -> str:
+    if not raw:
+        return "—"
+    try:
+        return _date.fromisoformat(raw[:10]).strftime("%d.%m.%Y")
+    except Exception:
+        return raw
+
+
+def _extract_period_starts(logs: dict | None) -> list[_date]:
+    """Pick out the FIRST day of each period episode from the cycle logs.
+
+    ``logs`` is a dict of ISO-date string → log entry. Entries with
+    ``flow`` in {"light","medium","heavy","spotting"} are part of a
+    bleeding day. Consecutive bleeding days are merged into one episode
+    and its first day is the cycle start.
+    """
+    if not logs or not isinstance(logs, dict):
+        return []
+    bleeding_levels = {"light", "medium", "heavy", "spotting"}
+    bleeding_days: list[_date] = []
+    for k, v in logs.items():
+        if not isinstance(v, dict):
+            continue
+        flow = v.get("flow") or v.get("flowLevel")
+        if isinstance(flow, str) and flow.lower() in bleeding_levels:
+            try:
+                bleeding_days.append(_date.fromisoformat(k[:10]))
+            except Exception:
+                continue
+    bleeding_days.sort()
+    starts: list[_date] = []
+    for d in bleeding_days:
+        if not starts or (d - starts[-1]).days > 2:
+            starts.append(d)
+        elif (d - starts[-1]).days <= 2 and (d - starts[-1]).days >= 0:
+            # contiguous-ish: skip, same episode
+            continue
+    return starts
+
+
+def _build_forecast(
+    last_start: _date | None,
+    avg_cycle: int,
+    avg_period: int,
+    months: int = 3,
+) -> str:
+    if last_start is None or not avg_cycle:
+        return ""
+    lines = [f"🩸 <b>Прогноз цикла на {months} мес.</b>"]
+    luteal = 14
+    cur = last_start
+    for i in range(1, months + 1):
+        nxt = cur + _timedelta(days=avg_cycle)
+        end = cur + _timedelta(days=max(0, avg_period - 1))
+        ovu = nxt - _timedelta(days=luteal)
+        lines.append(
+            f"• №{i}: <b>{cur:%d.%m}</b>—<b>{end:%d.%m}</b>"
+            f" • овуляция <b>{ovu:%d.%m}</b>"
+        )
+        cur = nxt
+    return "\n".join(lines)
+
+
+_TIER_LABELS = {
+    "premium": "✨ Lira Premium",
+    "basic": "📦 Твой ритм (Basic Box)",
+    "vip": "📦 Полная симфония (VIP Box)",
+}
+
+
+def _safe(v) -> str:
+    from html import escape as _esc
+
+    if v is None or v == "":
+        return "—"
+    return _esc(str(v))
+
+
+def _format_subscription_message(p: dict) -> str:
+    """Render the after-payment owner digest from the web payload."""
+    tier = (p.get("tier") or "").lower()
+    tier_title = _TIER_LABELS.get(tier, p.get("tierTitle") or tier or "—")
+    price = p.get("price")
+    paid_at = p.get("paidAt") or ""
+    order_id = p.get("orderId") or "—"
+    card_last4 = p.get("cardLast4")
+
+    profile = p.get("profile") or {}
+    settings_block = p.get("settings") or {}
+    shipping = p.get("shippingAddress") or {}
+    box = p.get("boxProfile") or {}
+    survey = p.get("surveyData") or {}
+    logs = p.get("logs") or {}
+
+    avg_cycle = int(
+        settings_block.get("averageCycleLength")
+        or box.get("cycleLength")
+        or survey.get("cycleLength")
+        or 28
+    )
+    avg_period = int(
+        settings_block.get("averagePeriodLength")
+        or box.get("periodLength")
+        or survey.get("periodLength")
+        or 5
+    )
+
+    starts = _extract_period_starts(logs)
+    last_start = starts[-1] if starts else None
+    # If logs don't contain bleeding days, fall back to box/survey-provided date
+    if last_start is None:
+        for k in ("lastPeriodStart", "lastPeriod", "periodStartDate"):
+            raw = box.get(k) or survey.get(k)
+            if raw:
+                try:
+                    last_start = _date.fromisoformat(str(raw)[:10])
+                    break
+                except Exception:
+                    continue
+
+    lines: list[str] = []
+    lines.append("💰 <b>Новая оплата + анкета (web)</b>")
+    lines.append("")
+    lines.append("<b>Платёж</b>")
+    lines.append(f"• Тариф: <b>{_safe(tier_title)}</b>")
+    if price is not None:
+        lines.append(f"• Цена: <b>{_safe(price)} ₽</b>")
+    lines.append(f"• Оплачено: <b>{_format_iso_date(paid_at[:10])}</b>")
+    if card_last4:
+        lines.append(f"• Карта: <code>•••• {_safe(card_last4)}</code>")
+    lines.append(f"• Order ID: <code>{_safe(order_id)}</code>")
+    lines.append("")
+
+    lines.append("<b>Профиль</b>")
+    lines.append(f"• Имя: {_safe(profile.get('name'))}")
+    if profile.get("birthdate"):
+        lines.append(f"• Дата рождения: {_format_iso_date(profile.get('birthdate'))}")
+    if profile.get("phone"):
+        lines.append(f"• Телефон: {_safe(profile.get('phone'))}")
+    lines.append("")
+
+    if shipping:
+        lines.append("<b>Адрес доставки</b>")
+        lines.append(f"• Получатель: {_safe(shipping.get('recipient'))}")
+        lines.append(f"• Страна: {_safe(shipping.get('country'))}")
+        lines.append(f"• Город: {_safe(shipping.get('city'))}")
+        lines.append(f"• Улица: {_safe(shipping.get('street'))}")
+        bld = shipping.get("building")
+        apt = shipping.get("apartment") or shipping.get("flat")
+        lines.append(f"• Дом / кв.: {_safe(bld)} / {_safe(apt)}")
+        lines.append(f"• Индекс: {_safe(shipping.get('postal') or shipping.get('postcode'))}")
+        lines.append(f"• Телефон: {_safe(shipping.get('phone'))}")
+        lines.append("")
+
+    # boxProfile / surveyData — flatten any string/number/list answers
+    answers: dict = {}
+    for src in (box, survey):
+        if isinstance(src, dict):
+            for k, v in src.items():
+                if k.startswith("_"):
+                    continue
+                if k in {"lastPeriodStart", "cycleLength", "periodLength"}:
+                    continue
+                answers.setdefault(k, v)
+    if answers:
+        lines.append("<b>Анкета</b>")
+        for k, v in answers.items():
+            if isinstance(v, (list, tuple)):
+                v = ", ".join(_safe(x) for x in v) if v else "—"
+            elif isinstance(v, dict):
+                v = _json.dumps(v, ensure_ascii=False)
+            lines.append(f"• {_safe(k)}: {_safe(v)}")
+        lines.append("")
+
+    lines.append("<b>Цикл</b>")
+    lines.append(f"• Средний цикл: <b>{avg_cycle} дн.</b>")
+    lines.append(f"• Длина месячных: <b>{avg_period} дн.</b>")
+    if last_start:
+        lines.append(f"• Последние месячные: <b>{last_start:%d.%m.%Y}</b>")
+    lines.append("")
+
+    forecast = _build_forecast(last_start, avg_cycle, avg_period, months=3)
+    if forecast:
+        lines.append(forecast)
+        lines.append("")
+
+    lines.append(
+        f"<i>{_format_iso_date(paid_at[:10])} • оплата прошла, ждём сборку бокса</i>"
+    )
+    return "\n".join(lines)
+
+
+async def _send_admin(text: str) -> bool:
+    """Send a Telegram message to the operator chat. Returns False if no
+    bot is available or admin chat is unset."""
+    bot = _shared_bot
+    settings = get_settings()
+    if bot is None or not settings.admin_chat_id:
+        log.warning(
+            "admin send skipped: shared_bot=%s admin_chat_id=%s",
+            bool(bot),
+            settings.admin_chat_id,
+        )
+        return False
+    try:
+        await bot.send_message(  # type: ignore[attr-defined]
+            chat_id=settings.admin_chat_id,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return True
+    except Exception:
+        log.exception("admin send failed")
+        return False
+
+
+@app.post("/v1/lira/onboarding")
+async def lira_onboarding(body: _LiraOnboardingIn) -> _LiraGenericOut:
+    """Web bundle calls this when the user FINISHES the questionnaire but
+    before paying. Currently a no-op: we wait for the payment hook to
+    fire the single combined digest. We log it for visibility."""
+    payload = body.model_dump()
+    log.info(
+        "lira-onboarding: device=%s tz=%s",
+        payload.get("device_id"),
+        payload.get("timezone"),
+    )
+    return _LiraGenericOut(ok=True)
+
+
+@app.post("/v1/lira/subscription")
+async def lira_subscription(body: _LiraOnboardingIn) -> _LiraGenericOut:
+    """Web bundle calls this when the user has PAID. Format and forward
+    the full digest (payment + survey + cycle forecast) to the owner's
+    Telegram chat."""
+    payload = body.model_dump()
+    log.info(
+        "lira-subscription: order=%s tier=%s",
+        payload.get("orderId"),
+        payload.get("tier"),
+    )
+    text = _format_subscription_message(payload)
+    ok = await _send_admin(text)
+    return _LiraGenericOut(ok=ok)
+
+
+@app.post("/v1/lira/cycle-update")
+async def lira_cycle_update(body: _LiraOnboardingIn) -> _LiraGenericOut:
+    """Web bundle calls this when the user's forecasted next-period date
+    has shifted by more than ±2 days (e.g. she logged a period earlier
+    than expected). Send the operator a short delta message."""
+    payload = body.model_dump()
+    name = payload.get("name") or "клиент"
+    prev_raw = payload.get("previous_next_period")
+    logs = payload.get("logs") or {}
+    settings_block = payload.get("settings") or {}
+    avg_cycle = int(settings_block.get("averageCycleLength") or 28)
+    avg_period = int(settings_block.get("averagePeriodLength") or 5)
+    starts = _extract_period_starts(logs)
+    last_start = starts[-1] if starts else None
+    new_forecast = _build_forecast(last_start, avg_cycle, avg_period, months=3)
+    lines = [
+        "🔄 <b>Цикл пересчитан</b>",
+        f"Клиент: <b>{_safe(name)}</b>",
+    ]
+    if prev_raw:
+        lines.append(f"Был прогноз следующих М: <b>{_format_iso_date(prev_raw)}</b>")
+    if last_start:
+        next_start = last_start + _timedelta(days=avg_cycle)
+        lines.append(f"Стал прогноз: <b>{next_start:%d.%m.%Y}</b>")
+    lines.append("")
+    if new_forecast:
+        lines.append(new_forecast)
+    ok = await _send_admin("\n".join(lines))
+    return _LiraGenericOut(ok=ok)
+
+
+@app.get("/v1/lira/status")
+async def lira_status() -> dict:
+    """Stub for the bundled chat UI's status check. Reports that the
+    chat backend is offline so the UI degrades gracefully."""
+    return {"online": False, "models": []}
+
+
+@app.post("/v1/lira/chat")
+async def lira_chat(body: _LiraOnboardingIn) -> dict:
+    """Stub for the bundled chat UI. Returns a polite refusal so the
+    UI shows the message rather than spinning forever."""
+    return {
+        "reply": (
+            "Ассистент Lira временно недоступен. Я могу ответить тебе "
+            "напрямую в Telegram-боте @lowerBsk24_bot — там есть оператор."
+        ),
+        "online": False,
+    }
 
 
 # ---------------------------------------------------------------------- #
