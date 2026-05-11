@@ -386,7 +386,7 @@ async def pair_forecast(token: str, body: ForecastIn) -> ForecastOut:
 # sends it to ``settings.admin_chat_id`` — i.e. the owner's Telegram chat.
 
 import json as _json  # noqa: E402  — local alias to avoid conflict
-from datetime import date as _date, timedelta as _timedelta  # noqa: E402
+from datetime import date as _date, datetime, timedelta as _timedelta  # noqa: E402
 
 
 class _LiraOnboardingIn(BaseModel):
@@ -470,6 +470,50 @@ _TIER_LABELS = {
     "vip": "📦 Полная симфония (VIP Box)",
 }
 
+# English ``q.id`` (used as keys in the web survey draft) → Russian label
+# shown in the operator's Telegram digest. Matches the 7-step bot
+# questionnaire so the same field names are consistent across both flows.
+_SURVEY_LABELS = {
+    # Step 1 — profile (these usually live under p['profile'] but the
+    # web survey stores them under boxProfile/surveyData too)
+    "name": "Имя",
+    "birth_year": "Год рождения",
+    "city": "Город",
+    "cycle_length": "Длина цикла, дн.",
+    "period_length": "Длина М, дн.",
+    "last_period_date": "Последние М",
+    # Step 2 — hygiene
+    "pads": "Прокладки",
+    "tampons": "Тампоны",
+    "other_hygiene": "Чаши / трусы",
+    "flow_heaviness": "Обильность",
+    # Step 3 — allergies
+    "allergies": "Аллергии",
+    "sensitive_skin": "Чувствительная кожа",
+    "allergy_notes": "Заметки по аллергиям",
+    # Step 4 — lifestyle
+    "diet": "Питание",
+    "goal": "Цель",
+    "joys": "Радует",
+    "novelty": "Любовь к новинкам",
+    "dislikes": "Не любит",
+    # Step 5 — deep preferences
+    "favorite_season": "Любимый сезон",
+    "calming": "Успокаивает",
+    "occupation": "Род деятельности",
+    "hobbies": "Хобби",
+    # Step 7 — promo
+    "promo": "Промокод",
+    # Legacy / older web-survey ids (kept for backwards-compat with the
+    # previous SURVEY array; mapped to similar labels):
+    "hygiene": "Гигиена в боксе",
+    "hygiene_brands": "Любимые бренды",
+    "sweet": "Сладкое",
+    "care": "Уход",
+    "skin": "Тип кожи",
+    "tea": "Чай",
+}
+
 
 def _safe(v) -> str:
     from html import escape as _esc
@@ -495,31 +539,48 @@ def _format_subscription_message(p: dict) -> str:
     survey = p.get("surveyData") or {}
     logs = p.get("logs") or {}
 
-    avg_cycle = int(
+    def _survey_get(*keys):
+        for k in keys:
+            for src in (survey, box):
+                if isinstance(src, dict) and src.get(k) not in (None, ""):
+                    return src.get(k)
+        return None
+
+    def _coerce_int(v, default):
+        try:
+            return int(str(v).strip())
+        except (TypeError, ValueError):
+            return default
+
+    avg_cycle = _coerce_int(
         settings_block.get("averageCycleLength")
-        or box.get("cycleLength")
-        or survey.get("cycleLength")
-        or 28
+        or _survey_get("cycle_length", "cycleLength"),
+        28,
     )
-    avg_period = int(
+    avg_period = _coerce_int(
         settings_block.get("averagePeriodLength")
-        or box.get("periodLength")
-        or survey.get("periodLength")
-        or 5
+        or _survey_get("period_length", "periodLength"),
+        5,
     )
 
     starts = _extract_period_starts(logs)
     last_start = starts[-1] if starts else None
-    # If logs don't contain bleeding days, fall back to box/survey-provided date
+    # If logs don't contain bleeding days, fall back to box/survey-provided date.
+    # Accept both ISO (YYYY-MM-DD) and Russian (DD.MM.YYYY) formats — the web
+    # survey collects the latter via a text input.
     if last_start is None:
-        for k in ("lastPeriodStart", "lastPeriod", "periodStartDate"):
-            raw = box.get(k) or survey.get(k)
-            if raw:
+        for k in ("last_period_date", "lastPeriodStart", "lastPeriod", "periodStartDate"):
+            raw = _survey_get(k)
+            if not raw:
+                continue
+            for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
                 try:
-                    last_start = _date.fromisoformat(str(raw)[:10])
+                    last_start = datetime.strptime(str(raw)[:10], fmt).date()
                     break
                 except Exception:
                     continue
+            if last_start:
+                break
 
     lines: list[str] = []
     lines.append("💰 <b>Новая оплата + анкета (web)</b>")
@@ -534,45 +595,97 @@ def _format_subscription_message(p: dict) -> str:
     lines.append(f"• Order ID: <code>{_safe(order_id)}</code>")
     lines.append("")
 
+    # ---- Профиль -----------------------------------------------------
+    # Prefer answers from the in-app questionnaire (Step 1) over the
+    # generic app profile; fall back to the latter for missing fields.
+    p_name = _survey_get("name") or profile.get("name")
+    p_birth = _survey_get("birth_year") or profile.get("birthdate")
+    p_city = _survey_get("city")
+    p_phone = profile.get("phone") or (shipping or {}).get("phone")
     lines.append("<b>Профиль</b>")
-    lines.append(f"• Имя: {_safe(profile.get('name'))}")
-    if profile.get("birthdate"):
-        lines.append(f"• Дата рождения: {_format_iso_date(profile.get('birthdate'))}")
-    if profile.get("phone"):
-        lines.append(f"• Телефон: {_safe(profile.get('phone'))}")
+    lines.append(f"• Имя: {_safe(p_name)}")
+    if p_birth:
+        # Step 1 stores a YYYY year as plain text; profile.birthdate is ISO date.
+        b = str(p_birth)
+        if len(b) >= 8 and "-" in b:
+            lines.append(f"• Дата рождения: {_format_iso_date(b)}")
+        else:
+            lines.append(f"• Год рождения: {_safe(b)}")
+    if p_city:
+        lines.append(f"• Город: {_safe(p_city)}")
+    if p_phone:
+        lines.append(f"• Телефон: {_safe(p_phone)}")
     lines.append("")
 
     if shipping:
         lines.append("<b>Адрес доставки</b>")
-        lines.append(f"• Получатель: {_safe(shipping.get('recipient'))}")
-        lines.append(f"• Страна: {_safe(shipping.get('country'))}")
+        # Web address form fields: name, phone, city, zip, street, apt.
+        # Older / API-payload fields: recipient, country, building, apartment, postal.
+        recipient = shipping.get("recipient") or shipping.get("name")
+        lines.append(f"• Получатель: {_safe(recipient)}")
+        if shipping.get("country"):
+            lines.append(f"• Страна: {_safe(shipping.get('country'))}")
         lines.append(f"• Город: {_safe(shipping.get('city'))}")
-        lines.append(f"• Улица: {_safe(shipping.get('street'))}")
+        street = shipping.get("street")
+        lines.append(f"• Улица: {_safe(street)}")
         bld = shipping.get("building")
-        apt = shipping.get("apartment") or shipping.get("flat")
-        lines.append(f"• Дом / кв.: {_safe(bld)} / {_safe(apt)}")
-        lines.append(f"• Индекс: {_safe(shipping.get('postal') or shipping.get('postcode'))}")
-        lines.append(f"• Телефон: {_safe(shipping.get('phone'))}")
+        apt = shipping.get("apartment") or shipping.get("apt") or shipping.get("flat")
+        if bld or apt:
+            lines.append(f"• Дом / кв.: {_safe(bld)} / {_safe(apt)}")
+        idx = shipping.get("postal") or shipping.get("postcode") or shipping.get("zip")
+        if idx:
+            lines.append(f"• Индекс: {_safe(idx)}")
+        if shipping.get("phone"):
+            lines.append(f"• Телефон: {_safe(shipping.get('phone'))}")
         lines.append("")
 
-    # boxProfile / surveyData — flatten any string/number/list answers
+    # ---- Анкета ------------------------------------------------------
+    # boxProfile / surveyData — flatten any string/number/list answers.
+    # Profile-Step-1 fields and address are already shown above, so skip them
+    # here. Keys not in _SURVEY_LABELS are passed through as-is (best-effort).
+    skip = {
+        "name",
+        "birth_year",
+        "city",
+        "cycle_length",
+        "period_length",
+        "last_period_date",
+        # legacy aliases
+        "cycleLength",
+        "periodLength",
+        "lastPeriodStart",
+        "address",
+        "shippingAddress",
+    }
     answers: dict = {}
-    for src in (box, survey):
-        if isinstance(src, dict):
-            for k, v in src.items():
-                if k.startswith("_"):
-                    continue
-                if k in {"lastPeriodStart", "cycleLength", "periodLength"}:
-                    continue
-                answers.setdefault(k, v)
+    extras: dict = {}
+    for src in (survey, box):
+        if not isinstance(src, dict):
+            continue
+        for k, v in src.items():
+            if k in skip:
+                continue
+            if k.endswith("_other"):
+                extras[k[:-6]] = v
+                continue
+            if k.startswith("_"):
+                continue
+            answers.setdefault(k, v)
     if answers:
         lines.append("<b>Анкета</b>")
         for k, v in answers.items():
+            label = _SURVEY_LABELS.get(k, k)
             if isinstance(v, (list, tuple)):
-                v = ", ".join(_safe(x) for x in v) if v else "—"
+                parts = [_safe(x) for x in v if x not in (None, "")]
+                extra = extras.get(k)
+                if extra and str(extra).strip():
+                    parts.append("Своё: " + _safe(extra))
+                v_text = ", ".join(parts) if parts else "—"
             elif isinstance(v, dict):
-                v = _json.dumps(v, ensure_ascii=False)
-            lines.append(f"• {_safe(k)}: {_safe(v)}")
+                v_text = _safe(_json.dumps(v, ensure_ascii=False))
+            else:
+                v_text = _safe(v)
+            lines.append(f"• {_safe(label)}: {v_text}")
         lines.append("")
 
     lines.append("<b>Цикл</b>")
