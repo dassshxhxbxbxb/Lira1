@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import re
+from datetime import date, datetime
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -118,6 +119,31 @@ async def _ensure_profile(message_or_callback):
 
 def _q(text: str) -> str:
     return f"<b>{text}</b>"
+
+
+_DATE_PATTERNS = (
+    "%d.%m.%Y",
+    "%d.%m.%y",
+    "%d/%m/%Y",
+    "%d/%m/%y",
+    "%d-%m-%Y",
+    "%d-%m-%y",
+    "%Y-%m-%d",
+)
+
+
+def _parse_ru_date(raw: str) -> date | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    # Normalize separators
+    raw = re.sub(r"\s+", "", raw)
+    for fmt in _DATE_PATTERNS:
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 # ---- Step 1: basic ------------------------------------------------------ #
@@ -259,7 +285,40 @@ async def step_period_length(message: Message, state: FSMContext) -> None:
         await message.answer("Обычно 3–7 дней. Уточни.")
         return
     await _save_field(message, period_length_days=days)
-    # Step 2 begins
+    await state.set_state(Onboarding.last_period_date)
+    await message.answer(
+        _q(
+            "Когда начались последние месячные? Пришли дату в формате "
+            "<code>ДД.ММ.ГГГГ</code> (например <code>03.05.2026</code>). "
+            "Если не помнишь — напиши «пропустить»."
+        ),
+        parse_mode="HTML",
+    )
+
+
+@router.message(Onboarding.last_period_date)
+async def step_last_period_date(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip().lower()
+    if raw in {"пропустить", "skip", "не помню", "—", "-"}:
+        await _save_field(message, last_period_start=None)
+        await _start_step2(message, state)
+        return
+    parsed = _parse_ru_date(raw)
+    if parsed is None:
+        await message.answer(
+            "Не понял дату. Пришли в формате <code>ДД.ММ.ГГГГ</code>, "
+            "например <code>03.05.2026</code>, или напиши «пропустить».",
+            parse_mode="HTML",
+        )
+        return
+    today = date.today()
+    if parsed > today:
+        await message.answer("Дата в будущем — не может быть. Уточни.")
+        return
+    if (today - parsed).days > 365:
+        await message.answer("Дата слишком давно (>1 года). Уточни.")
+        return
+    await _save_field(message, last_period_start=parsed)
     await _start_step2(message, state)
 
 

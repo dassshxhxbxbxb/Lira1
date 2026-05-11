@@ -337,6 +337,28 @@ async def pair_forecast(token: str, body: ForecastIn) -> ForecastOut:
             )
         except Exception:  # pragma: no cover — best-effort notification
             log.exception("forecast confirmation send failed")
+        # Also notify the operator (admin) so they see the updated dates.
+        settings = get_settings()
+        if settings.admin_chat_id:
+            lines = [
+                "🔄 <b>Обновился прогноз цикла</b>",
+                f"Клиент: <code>{chat_id}</code>",
+                "",
+            ]
+            for i, e in enumerate(parsed, 1):
+                lines.append(
+                    f"• №{i}: <b>{e.cycle_start:%d.%m}</b>—"
+                    f"<b>{e.period_end:%d.%m}</b>"
+                    f" • овуляция <b>{e.ovulation:%d.%m}</b>"
+                )
+            try:
+                await _shared_bot.send_message(  # type: ignore[attr-defined]
+                    chat_id=settings.admin_chat_id,
+                    text="\n".join(lines),
+                    parse_mode="HTML",
+                )
+            except Exception:  # pragma: no cover
+                log.exception("admin forecast notification failed")
     return ForecastOut(ok=True, stored=stored)
 
 

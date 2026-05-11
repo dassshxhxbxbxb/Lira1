@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from html import escape
 from typing import TYPE_CHECKING, Mapping, Sequence
 
@@ -119,6 +119,33 @@ def _user_link(user_tg: "TGUser") -> str:
     )
 
 
+def format_cycle_forecast(profile: "Profile", *, months: int = 3) -> str:
+    """Render a forecast block listing the next ``months`` cycles.
+
+    Uses ``profile.last_period_start`` + ``cycle_length_days`` + ``period_length_days``
+    to compute period range and ovulation date for each upcoming cycle. The
+    luteal phase is assumed to be 14 days (standard fertility model).
+    """
+    start = profile.last_period_start
+    cycle_len = profile.cycle_length_days
+    period_len = profile.period_length_days or 5
+    if start is None or not cycle_len:
+        return ""
+    lines = [f"🩸 <b>Прогноз цикла на {months} мес.</b>"]
+    luteal = 14
+    cur = start
+    for i in range(1, months + 1):
+        next_start = cur + timedelta(days=cycle_len)
+        period_end = cur + timedelta(days=max(0, period_len - 1))
+        ovulation = next_start - timedelta(days=luteal)
+        lines.append(
+            f"• №{i}: <b>{cur:%d.%m}</b>—<b>{period_end:%d.%m}</b>"
+            f" • овуляция <b>{ovulation:%d.%m}</b>"
+        )
+        cur = next_start
+    return "\n".join(lines)
+
+
 def format_full_profile(user_tg: "TGUser", profile: "Profile") -> str:
     """HTML digest of every answer the client gave during the questionnaire."""
     lines: list[str] = []
@@ -200,6 +227,10 @@ def format_full_profile(user_tg: "TGUser", profile: "Profile") -> str:
     lines.append(f"• Индекс: {_h(profile.address_postal)}")
     lines.append(f"• Телефон: {_h(profile.address_phone)}")
     lines.append("")
+    forecast = format_cycle_forecast(profile, months=3)
+    if forecast:
+        lines.append(forecast)
+        lines.append("")
     lines.append(
         "<i>"
         + escape(datetime.now().strftime("%d.%m.%Y %H:%M"))
