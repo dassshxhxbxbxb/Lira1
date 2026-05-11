@@ -73,7 +73,10 @@ export const computeCycleStats = (
   }
 
   // Compute average period length by counting consecutive bleeding days
-  // starting from each detected period start.
+  // starting from each detected period start. Skip single-day entries —
+  // those are typically users who marked "period started" once but haven't
+  // logged the rest yet, and treating them as 1-day periods would shrink
+  // every projection to a single day.
   const periodLengths: number[] = [];
   for (const start of periodStarts) {
     let len = 0;
@@ -83,7 +86,7 @@ export const computeCycleStats = (
       cursor = addDays(cursor, 1);
       if (len > 14) break; // safety
     }
-    if (len > 0) periodLengths.push(len);
+    if (len >= 2) periodLengths.push(len);
   }
   const avgPeriod =
     periodLengths.length > 0
@@ -119,6 +122,63 @@ export interface CyclePredictions {
   averageSource: 'logs' | 'settings';
 }
 
+export interface CycleForecastEntry {
+  /** ISO date — first day of bleeding for this projected cycle. */
+  cycle_start: string;
+  /** Last day of bleeding for this projected cycle. */
+  period_end: string;
+  /** Predicted ovulation date (cycle_start + cycleLen - lutealPhase). */
+  ovulation: string;
+  /** Start of the 6-day fertile window (ovulation - 5d). */
+  fertile_start: string;
+  /** End of the fertile window (ovulation + 1d). */
+  fertile_end: string;
+}
+
+/**
+ * Project the next ``count`` cycles forward from the latest known
+ * period start. Used by the Telegram-pairing flow to ship a privacy-
+ * minimal forecast (just bleeding / ovulation / fertile dates) to the
+ * bot so it can schedule box deliveries without the user typing a code.
+ */
+export const forecastUpcomingCycles = (
+  logs: Record<string, DayLog>,
+  settings: Settings,
+  today: Date = new Date(),
+  count = 3,
+): CycleForecastEntry[] => {
+  const stats = computeCycleStats(logs, settings);
+  const cycleLen = stats.averageCycleLength ?? settings.averageCycleLength;
+  const periodLen = stats.averagePeriodLength ?? settings.averagePeriodLength;
+  const lastStart = stats.periodStarts.length
+    ? stats.periodStarts[stats.periodStarts.length - 1]
+    : null;
+  if (!lastStart) return [];
+
+  let cursor = addDays(parseISO(lastStart), cycleLen);
+  while (differenceInCalendarDays(cursor, today) < 0) {
+    cursor = addDays(cursor, cycleLen);
+  }
+
+  const out: CycleForecastEntry[] = [];
+  for (let i = 0; i < count; i++) {
+    const cycleStart = cursor;
+    const periodEnd = addDays(cycleStart, Math.max(0, periodLen - 1));
+    const ovulation = addDays(cycleStart, cycleLen - settings.lutealPhaseLength);
+    const fertileStart = addDays(ovulation, -5);
+    const fertileEnd = addDays(ovulation, 1);
+    out.push({
+      cycle_start: fmt(cycleStart),
+      period_end: fmt(periodEnd),
+      ovulation: fmt(ovulation),
+      fertile_start: fmt(fertileStart),
+      fertile_end: fmt(fertileEnd),
+    });
+    cursor = addDays(cursor, cycleLen);
+  }
+  return out;
+};
+
 export const computePredictions = (
   logs: Record<string, DayLog>,
   settings: Settings,
@@ -126,7 +186,11 @@ export const computePredictions = (
 ): CyclePredictions => {
   const stats = computeCycleStats(logs, settings);
   const cycleLen = stats.averageCycleLength ?? settings.averageCycleLength;
-  const periodLen = stats.averagePeriodLength ?? settings.averagePeriodLength;
+  const rawPeriodLen = stats.averagePeriodLength ?? settings.averagePeriodLength;
+  // Clamp the projected period length to at least 3 days (medical baseline)
+  // so visual projections never collapse to a single day on accounts with
+  // only one logged bleeding day or an unusually low override.
+  const periodLen = Math.max(rawPeriodLen, 3);
   const averageSource: 'logs' | 'settings' =
     stats.averageCycleLength !== null ? 'logs' : 'settings';
 
@@ -212,6 +276,18 @@ export const buildDayMarkers = (
       log.intimacy
     ) {
       add(date, 'logged');
+    }
+  }
+
+  // Project the most recently detected period forward by the average period
+  // length so a single tap on "period started" visually extends across the
+  // expected bleeding window even before the user logs each subsequent day.
+  if (predictions.lastPeriodStart) {
+    const periodLen = predictions.effectivePeriodLength;
+    const startCursor = parseISO(predictions.lastPeriodStart);
+    for (let i = 0; i < periodLen; i++) {
+      const d = fmt(addDays(startCursor, i));
+      if (!isBleeding(logs[d])) add(d, 'predictedPeriod');
     }
   }
 

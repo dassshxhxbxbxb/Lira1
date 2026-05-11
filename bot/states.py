@@ -11,6 +11,7 @@ class Onboarding(StatesGroup):
     flow_code_input = State()
     cycle_length = State()
     period_length = State()
+    last_period_date = State()
 
     # Step 2: hygiene
     pads = State()

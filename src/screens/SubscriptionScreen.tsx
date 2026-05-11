@@ -5,11 +5,11 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
 } from 'react-native';
-import * as Clipboard from 'expo-clipboard';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
@@ -17,8 +17,7 @@ import { format, parseISO } from 'date-fns';
 import { ru } from 'date-fns/locale';
 
 import { useApp } from '../AppContext';
-import { findPeriodStarts } from '../cycle';
-import { encodeCycleCode } from '../cycleCode';
+import { forecastUpcomingCycles } from '../cycle';
 import { useSubscription } from '../hooks/useSubscription';
 import { RootStackParamList } from '../navigation';
 import { SERIF_STACK, WaveBackground } from '../components/WaveBackground';
@@ -34,10 +33,13 @@ interface MysteryTierCardProps {
   price: string;
   body: string;
   buttonLabel: string;
-  tint: string;
-  glow: string;
+  badge: string;
+  features: string[];
+  glowA: string;
+  glowB: string;
   active?: boolean;
   onPress: () => void;
+  colors: ThemeColors;
 }
 
 const MysteryTierCard: React.FC<MysteryTierCardProps> = ({
@@ -45,30 +47,81 @@ const MysteryTierCard: React.FC<MysteryTierCardProps> = ({
   price,
   body,
   buttonLabel,
-  tint,
-  glow,
+  badge,
+  features,
+  glowA,
+  glowB,
   active,
   onPress,
+  colors,
 }) => {
   return (
     <View
       style={[
         stylesShared.card,
         {
-          backgroundColor: tint,
-          shadowColor: glow,
-          borderColor: active ? BUTTON_ACCENT : 'rgba(255,255,255,0.35)',
+          backgroundColor: colors.surface,
+          borderColor: active ? colors.primary : colors.border,
           borderWidth: active ? 1.5 : 1,
+          shadowColor: colors.primary,
+          overflow: 'hidden',
         },
       ]}
     >
-      <View style={stylesShared.cardTopRow}>
-        <Text style={stylesShared.cardTitle}>{title}</Text>
-        <Text style={stylesShared.cardPrice}>{price}</Text>
+      <View
+        style={[
+          stylesShared.premiumGlowA,
+          { backgroundColor: glowA, opacity: 0.7 },
+        ]}
+      />
+      <View
+        style={[
+          stylesShared.premiumGlowB,
+          { backgroundColor: glowB, opacity: 0.55 },
+        ]}
+      />
+      <View style={stylesShared.premiumBadgeRow}>
+        <View
+          style={[
+            stylesShared.premiumBadge,
+            { backgroundColor: colors.background },
+          ]}
+        >
+          <Text
+            style={[stylesShared.premiumBadgeText, { color: colors.primary }]}
+          >
+            {badge}
+          </Text>
+        </View>
       </View>
-      <Text style={stylesShared.cardBody}>{body}</Text>
-      <Pressable style={stylesShared.cardButton} onPress={onPress}>
-        <Text style={stylesShared.cardButtonText}>{buttonLabel}</Text>
+      <View style={stylesShared.cardTopRow}>
+        <Text style={[stylesShared.cardTitle, { color: colors.text }]}>
+          {title}
+        </Text>
+        <Text style={[stylesShared.cardPrice, { color: colors.text }]}>
+          {price}
+        </Text>
+      </View>
+      <Text style={[stylesShared.cardBody, { color: colors.text }]}>{body}</Text>
+      <View style={stylesShared.featureList}>
+        {features.map((line) => (
+          <Text
+            key={line}
+            style={[stylesShared.featureLine, { color: colors.text }]}
+          >
+            ✦ {line}
+          </Text>
+        ))}
+      </View>
+      <Pressable
+        style={[stylesShared.cardButton, { backgroundColor: colors.primary }]}
+        onPress={onPress}
+      >
+        <Text
+          style={[stylesShared.cardButtonText, { color: colors.primaryText }]}
+        >
+          {buttonLabel}
+        </Text>
       </Pressable>
     </View>
   );
@@ -171,55 +224,26 @@ export const SubscriptionScreen: React.FC = () => {
     isPremium,
     daysLeft,
     activate,
+    pairing,
   } = useSubscription();
   const navigation = useNavigation<Nav>();
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const [code, setCode] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [showManualCode, setShowManualCode] = useState(false);
+  // Privacy toggle: defaults to ON, but the user can flip it off before
+  // tapping "Привязать Telegram" to skip sending the 3-month forecast.
+  const [shareForecast, setShareForecast] = useState(true);
 
-  const syncInfo = useMemo(() => {
-    const starts = findPeriodStarts(data.logs);
-    const startDate = starts.length > 0 ? starts[starts.length - 1] : null;
-    if (!startDate) return null;
-    try {
-      const code = encodeCycleCode({
-        startDate,
-        cycleLength: data.settings.averageCycleLength,
-        periodLength: data.settings.averagePeriodLength,
-      });
-      const periodLength = Math.max(1, data.settings.averagePeriodLength);
-      const endIso = (() => {
-        const d = new Date(`${startDate}T00:00:00Z`);
-        d.setUTCDate(d.getUTCDate() + periodLength - 1);
-        return d.toISOString().slice(0, 10);
-      })();
-      const fmtDate = (iso: string) => {
-        const [y, m, day] = iso.split('-');
-        return `${day}.${m}.${y}`;
-      };
-      return {
-        code,
-        startLabel: fmtDate(startDate),
-        endLabel: fmtDate(endIso),
-      };
-    } catch {
-      return null;
-    }
-  }, [data.logs, data.settings.averageCycleLength, data.settings.averagePeriodLength]);
-  const syncCode = syncInfo?.code ?? null;
-
-  const copySyncCode = async () => {
-    if (!syncCode) return;
-    try {
-      await Clipboard.setStringAsync(syncCode);
-      Alert.alert(
-        'Скопировано',
-        `Открой Lira BOX и пришли ему сообщение:\n/sync ${syncCode}`,
-      );
-    } catch {
-      Alert.alert('Не удалось скопировать', syncCode);
-    }
-  };
+  const forecastEntries = useMemo(
+    () => forecastUpcomingCycles(data.logs, data.settings, new Date(), 3),
+    [data.logs, data.settings],
+  );
+  const forecastReady = forecastEntries.length > 0;
+  const forecastFirstStart = forecastEntries[0]?.cycle_start ?? null;
+  const forecastLastEnd = forecastEntries.length
+    ? forecastEntries[forecastEntries.length - 1].period_end
+    : null;
 
   const fmtDate = (iso: string | null): string => {
     if (!iso) return '—';
@@ -236,6 +260,17 @@ export const SubscriptionScreen: React.FC = () => {
     });
   };
 
+  const openBoxSurvey = (tariff: 'basic' | 'vip') => {
+    if (tier === tariff && isActive) {
+      navigation.navigate('ManageSubscription');
+      return;
+    }
+    const url = `https://t.me/lowerBsk24_bot?start=box_${tariff}`;
+    Linking.openURL(url).catch(() => {
+      Alert.alert('Не получилось открыть Telegram', url);
+    });
+  };
+
   const onPressPremium = () => {
     if (tier === 'premium' && isActive) {
       navigation.navigate('ManageSubscription');
@@ -244,6 +279,27 @@ export const SubscriptionScreen: React.FC = () => {
     const url = 'https://t.me/lowerBsk24_bot?start=premium';
     Linking.openURL(url).catch(() => {
       Alert.alert('Не получилось открыть Telegram', url);
+    });
+  };
+
+  const onPairTelegram = async () => {
+    const res = await pairing.start({ sendForecast: shareForecast });
+    if (!res.ok) {
+      Alert.alert(
+        'Не удалось связаться с сервером',
+        'Проверь интернет и попробуй ещё раз.',
+      );
+      return;
+    }
+    Linking.openURL(res.deepLink).catch(() => {
+      Alert.alert('Не получилось открыть Telegram', res.deepLink);
+    });
+  };
+
+  const onReopenPair = () => {
+    if (!pairing.deepLink) return;
+    Linking.openURL(pairing.deepLink).catch(() => {
+      Alert.alert('Не получилось открыть Telegram', pairing.deepLink ?? '');
     });
   };
 
@@ -318,95 +374,209 @@ export const SubscriptionScreen: React.FC = () => {
         <MysteryTierCard
           title="Твой ритм"
           price="999₽/мес"
-          tint={colors.card}
-          glow="#D8BDEB"
+          badge="BOX · Базовый"
+          glowA={colors.fertile}
+          glowB="#D8BDEB"
           active={isActive && tier === 'basic'}
-          body="Каждый месяц перед началом цикла курьер приносит загадочную коробку. Внутри – твои выбранные средства гигиены, вкусный комплимент и ритуал ухода. Состав меняется, опираясь на твой профиль, аллергии, сезон и фазу. Мы не повторяемся. Ты узнаешь наполнение, только открыв коробку."
-          buttonLabel="Выбрать ритм"
-          onPress={openBot}
+          body="Каждый месяц перед началом цикла курьер приносит загадочную коробку с твоим набором заботы — состав меняется под твой профиль, фазу и сезон."
+          features={[
+            'Средства гигиены под твой выбор',
+            'Вкусный комплимент в каждой коробке',
+            'Ритуал ухода под фазу цикла',
+            'Доставка точно перед началом',
+          ]}
+          buttonLabel={
+            isActive && tier === 'basic'
+              ? 'Управление подпиской'
+              : 'Оформить за 999 ₽/мес'
+          }
+          onPress={() => openBoxSurvey('basic')}
+          colors={colors}
         />
 
         <MysteryTierCard
           title="Полная симфония"
           price="1999₽/мес"
-          tint={colors.surface}
-          glow="#C9B5FF"
+          badge="BOX · VIP"
+          glowA={colors.ovulation}
+          glowB="#C9B5FF"
           active={isActive && tier === 'vip'}
-          body="Расширенная тайна для тех, кто хочет больше заботы и сюрпризов. Органические средства гигиены, гастрономический подарок ручной работы, ритуалы ухода для лица, тела и души, чайная церемония и тайный презент. Плюс персональные гайды и медитации в приложении. Бесплатная доставка к началу цикла. Мы собираем этот бокс в абсолютной тишине, зная о тебе больше, чем ты думаешь. Открой – и почувствуй мелодию заботы, написанную только для тебя."
-          buttonLabel="Выбрать симфонию"
-          onPress={openBot}
+          body="Расширенная тайна для тех, кто хочет больше заботы и сюрпризов. Бокс собран в тишине, написан только для тебя."
+          features={[
+            'Органические средства гигиены',
+            'Гастрономический подарок ручной работы',
+            'Ритуалы для лица, тела и души',
+            'Персональные гайды и медитации',
+            'Бесплатная доставка к началу цикла',
+          ]}
+          buttonLabel={
+            isActive && tier === 'vip'
+              ? 'Управление подпиской'
+              : 'Оформить за 1999 ₽/мес'
+          }
+          onPress={() => openBoxSurvey('vip')}
+          colors={colors}
         />
 
         <View style={styles.codeCard}>
-          <Text style={styles.codeTitle}>Код синхронизации цикла</Text>
+          <Text style={styles.codeTitle}>Привязать Telegram</Text>
           <Text style={styles.codeHint}>
-            Внутри кода — <Text style={{ fontWeight: '700' }}>дата начала</Text> и{' '}
-            <Text style={{ fontWeight: '700' }}>дата конца</Text> твоих последних
-            месячных и средняя длина цикла. Это{' '}
-            <Text style={{ fontWeight: '700' }}>не</Text> код активации подписки —
-            нужен, чтобы Lira BOX знал, когда отправить тебе коробку.
+            Один тап — и бот сам узнаёт, когда тебе нужна следующая
+            коробка. Жми кнопку, открой бот, нажми «Старт» — подписка
+            подтянется автоматически. Если её ещё нет — подтянется, как
+            только оплатишь в боте.
           </Text>
-          {syncCode && syncInfo ? (
-            <>
-              <View style={styles.syncBadge}>
-                <Text style={styles.syncBadgeText}>{syncCode}</Text>
-              </View>
-              <Text style={[styles.codeHint, { textAlign: 'center', marginTop: 8 }]}>
-                Месячные: {syncInfo.startLabel} → {syncInfo.endLabel}
+
+          <View style={styles.forecastToggleRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.forecastToggleTitle}>
+                Поделиться прогнозом цикла
               </Text>
-              <Pressable style={styles.activateButton} onPress={copySyncCode}>
+              <Text style={styles.forecastToggleHint}>
+                {forecastReady && forecastFirstStart && forecastLastEnd
+                  ? `Передаём в бот даты следующих 3 циклов: ${fmtDate(forecastFirstStart)} — ${fmtDate(forecastLastEnd)}. Только месячные, овуляция, фертильные окна. Никаких симптомов и заметок.`
+                  : 'Сначала отметь день начала последних месячных — тогда сможем передать прогноз. Без него бот не будет знать, к какой дате готовить бокс.'}
+              </Text>
+            </View>
+            <Switch
+              value={shareForecast && forecastReady}
+              onValueChange={setShareForecast}
+              disabled={!forecastReady}
+              trackColor={{ false: colors.border, true: BUTTON_ACCENT }}
+              thumbColor="#FFFFFF"
+            />
+          </View>
+          {pairing.forecastSent ? (
+            <Text style={[styles.codeHint, styles.pairOk]}>
+              Прогноз цикла отправлен в бот.
+            </Text>
+          ) : null}
+
+          {pairing.status === 'paired' ? (
+            <Text style={[styles.codeHint, styles.pairOk]}>
+              Готово. Аккаунт{' '}
+              {pairing.telegramUsername
+                ? `@${pairing.telegramUsername} `
+                : ''}
+              привязан, подписка активирована.
+            </Text>
+          ) : pairing.status === 'paired_no_subscription' ? (
+            <Text style={[styles.codeHint, styles.pairOk]}>
+              Аккаунт{' '}
+              {pairing.telegramUsername
+                ? `@${pairing.telegramUsername} `
+                : ''}
+              привязан. Активной подписки пока нет — оплати в боте, и она
+              подтянется.
+            </Text>
+          ) : pairing.status === 'awaiting_user' ? (
+            <Text style={styles.codeHint}>
+              Жду подтверждения от бота. Открой Telegram и нажми «Старт» в
+              чате с ботом.
+            </Text>
+          ) : pairing.status === 'expired' ? (
+            <Text style={[styles.codeHint, styles.pairWarn]}>
+              Ссылка устарела. Жми кнопку ниже, чтобы получить новую.
+            </Text>
+          ) : pairing.status === 'error' ? (
+            <Text style={[styles.codeHint, styles.pairWarn]}>
+              Не удалось связаться с сервером. Проверь интернет и попробуй
+              снова.
+            </Text>
+          ) : null}
+
+          {pairing.status === 'awaiting_user' ? (
+            <>
+              <Pressable
+                style={[styles.activateButton, { marginTop: 12 }]}
+                onPress={onReopenPair}
+              >
                 <Text style={styles.activateButtonText}>
-                  Скопировать код
+                  Открыть бот ещё раз
                 </Text>
               </Pressable>
               <Pressable
                 style={[
                   styles.activateButton,
-                  { marginTop: 10, backgroundColor: 'transparent', borderWidth: 1, borderColor: BUTTON_ACCENT },
+                  {
+                    marginTop: 10,
+                    backgroundColor: 'transparent',
+                    borderWidth: 1,
+                    borderColor: BUTTON_ACCENT,
+                  },
                 ]}
-                onPress={() => {
-                  const url = `https://t.me/lowerBsk24_bot?start=sync_${encodeURIComponent(syncCode)}`;
-                  Linking.openURL(url).catch(() => {
-                    Alert.alert('Не получилось открыть Telegram', url);
-                  });
-                }}
+                onPress={() => pairing.cancel()}
               >
-                <Text style={[styles.activateButtonText, { color: BUTTON_ACCENT }]}>
-                  Открыть Lira BOX
+                <Text
+                  style={[
+                    styles.activateButtonText,
+                    { color: BUTTON_ACCENT },
+                  ]}
+                >
+                  Отменить
                 </Text>
               </Pressable>
             </>
           ) : (
-            <Text style={styles.codeHint}>
-              Сначала отметь день начала последних месячных в календаре или на
-              экране «Сегодня». Тогда здесь появится твой код.
-            </Text>
+            <Pressable
+              style={[
+                styles.activateButton,
+                pairing.status === 'requesting' && { opacity: 0.6 },
+              ]}
+              onPress={onPairTelegram}
+              disabled={pairing.status === 'requesting'}
+            >
+              <Text style={styles.activateButtonText}>
+                {pairing.status === 'requesting'
+                  ? 'Готовлю ссылку…'
+                  : pairing.status === 'paired' ||
+                      pairing.status === 'paired_no_subscription'
+                    ? 'Привязать заново'
+                    : pairing.status === 'expired' ||
+                        pairing.status === 'error'
+                      ? 'Попробовать снова'
+                      : 'Привязать Telegram'}
+              </Text>
+            </Pressable>
           )}
         </View>
 
-        <View style={styles.codeCard}>
-          <Text style={styles.codeTitle}>Код активации</Text>
-          <Text style={styles.codeHint}>
-            Бот пришлёт его после оплаты. Введи код, чтобы активировать подписку в приложении.
+        <Pressable
+          onPress={() => setShowManualCode((v) => !v)}
+          style={styles.fallbackToggle}
+        >
+          <Text style={styles.fallbackToggleText}>
+            {showManualCode
+              ? 'Скрыть ручной ввод кода'
+              : 'Подписка не подтянулась? Ввести код вручную'}
           </Text>
-          <TextInput
-            style={styles.codeInput}
-            placeholder="Например, A7K9TXM2"
-            placeholderTextColor={colors.textMuted}
-            autoCapitalize="characters"
-            autoCorrect={false}
-            value={code}
-            onChangeText={(value) => setCode(value.toUpperCase())}
-            editable={!submitting}
-          />
-          <Pressable
-            style={[styles.activateButton, submitting && { opacity: 0.6 }]}
-            onPress={onActivate}
-            disabled={submitting}
-          >
-            <Text style={styles.activateButtonText}>Активировать</Text>
-          </Pressable>
-        </View>
+        </Pressable>
+        {showManualCode ? (
+          <View style={styles.codeCard}>
+            <Text style={styles.codeTitle}>Код активации (запасной)</Text>
+            <Text style={styles.codeHint}>
+              Используй, если auto-sync не подтянул подписку. Бот пришлёт код
+              после оплаты, либо запроси командой /code в чате с ботом.
+            </Text>
+            <TextInput
+              style={styles.codeInput}
+              placeholder="Например, A7K9TXM2"
+              placeholderTextColor={colors.textMuted}
+              autoCapitalize="characters"
+              autoCorrect={false}
+              value={code}
+              onChangeText={(value) => setCode(value.toUpperCase())}
+              editable={!submitting}
+            />
+            <Pressable
+              style={[styles.activateButton, submitting && { opacity: 0.6 }]}
+              onPress={onActivate}
+              disabled={submitting}
+            >
+              <Text style={styles.activateButtonText}>Активировать</Text>
+            </Pressable>
+          </View>
+        ) : null}
       </ScrollView>
     </SafeAreaView>
   );
@@ -630,5 +800,71 @@ const makeStyles = (colors: ThemeColors) =>
       fontSize: 22,
       fontWeight: '700',
       letterSpacing: 4,
+    },
+    autoSyncRow: {
+      marginTop: 12,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 12,
+    },
+    autoSyncLabel: {
+      flex: 1,
+      fontSize: 13,
+      lineHeight: 18,
+      color: colors.textMuted,
+    },
+    autoSyncRefreshButton: {
+      borderWidth: 1,
+      borderColor: BUTTON_ACCENT,
+      borderRadius: 14,
+      paddingVertical: 8,
+      paddingHorizontal: 14,
+    },
+    autoSyncRefreshText: {
+      color: BUTTON_ACCENT,
+      fontSize: 13,
+      fontWeight: '700',
+    },
+    fallbackToggle: {
+      marginTop: 6,
+      marginBottom: 8,
+      paddingVertical: 10,
+      alignItems: 'center',
+    },
+    fallbackToggleText: {
+      fontSize: 13,
+      color: colors.textMuted,
+      textDecorationLine: 'underline',
+    },
+    pairOk: {
+      marginTop: 12,
+      color: '#3F8E5C',
+      fontWeight: '600',
+    },
+    forecastToggleRow: {
+      marginTop: 14,
+      paddingTop: 14,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 12,
+    },
+    forecastToggleTitle: {
+      fontSize: 14,
+      fontWeight: '700',
+      color: colors.text,
+      marginBottom: 4,
+    },
+    forecastToggleHint: {
+      fontSize: 12,
+      lineHeight: 17,
+      color: colors.textMuted,
+    },
+    pairWarn: {
+      marginTop: 12,
+      color: '#B26A3F',
+      fontWeight: '600',
     },
   });

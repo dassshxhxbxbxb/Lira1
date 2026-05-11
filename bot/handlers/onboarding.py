@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import re
+from datetime import date, datetime
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -12,7 +13,7 @@ from aiogram.types import CallbackQuery, Message
 from bot.db import session_scope
 from bot.keyboards.common import multi_choice, single_choice, yes_no, confirm_keyboard
 from bot.services.admin_notify import notify_admin_full_profile
-from bot.services.cycle_code import decode_cycle_code
+from bot.services.cycle_code import decode_cycle_code, encode_cycle_code
 from bot.services.users import get_or_create_profile, get_or_create_user
 from bot.states import Onboarding
 
@@ -120,6 +121,31 @@ def _q(text: str) -> str:
     return f"<b>{text}</b>"
 
 
+_DATE_PATTERNS = (
+    "%d.%m.%Y",
+    "%d.%m.%y",
+    "%d/%m/%Y",
+    "%d/%m/%y",
+    "%d-%m-%Y",
+    "%d-%m-%y",
+    "%Y-%m-%d",
+)
+
+
+def _parse_ru_date(raw: str) -> date | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    # Normalize separators
+    raw = re.sub(r"\s+", "", raw)
+    for fmt in _DATE_PATTERNS:
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 # ---- Step 1: basic ------------------------------------------------------ #
 
 
@@ -203,10 +229,11 @@ async def step_flow_code(message: Message, state: FSMContext) -> None:
     payload = decode_cycle_code(raw)
     if payload is not None:
         # Valid sync code → skip cycle/period questions and jump to step 2.
+        canonical = encode_cycle_code(payload)
         await _save_field(
             message,
-            flow_app_code=raw.upper(),
-            cycle_sync_code=raw.upper(),
+            flow_app_code=canonical,
+            cycle_sync_code=canonical,
             last_period_start=payload.start_date,
             cycle_length_days=payload.cycle_length,
             period_length_days=payload.period_length,
@@ -258,7 +285,40 @@ async def step_period_length(message: Message, state: FSMContext) -> None:
         await message.answer("Обычно 3–7 дней. Уточни.")
         return
     await _save_field(message, period_length_days=days)
-    # Step 2 begins
+    await state.set_state(Onboarding.last_period_date)
+    await message.answer(
+        _q(
+            "Когда начались последние месячные? Пришли дату в формате "
+            "<code>ДД.ММ.ГГГГ</code> (например <code>03.05.2026</code>). "
+            "Если не помнишь — напиши «пропустить»."
+        ),
+        parse_mode="HTML",
+    )
+
+
+@router.message(Onboarding.last_period_date)
+async def step_last_period_date(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip().lower()
+    if raw in {"пропустить", "skip", "не помню", "—", "-"}:
+        await _save_field(message, last_period_start=None)
+        await _start_step2(message, state)
+        return
+    parsed = _parse_ru_date(raw)
+    if parsed is None:
+        await message.answer(
+            "Не понял дату. Пришли в формате <code>ДД.ММ.ГГГГ</code>, "
+            "например <code>03.05.2026</code>, или напиши «пропустить».",
+            parse_mode="HTML",
+        )
+        return
+    today = date.today()
+    if parsed > today:
+        await message.answer("Дата в будущем — не может быть. Уточни.")
+        return
+    if (today - parsed).days > 365:
+        await message.answer("Дата слишком давно (>1 года). Уточни.")
+        return
+    await _save_field(message, last_period_start=parsed)
     await _start_step2(message, state)
 
 
@@ -667,7 +727,12 @@ async def _save_address(message: Message, state: FSMContext, field: str) -> None
             )
         # Step 7
         await state.set_state(Onboarding.tariff)
-        await _show_tariffs(message)
+        data = await state.get_data()
+        preselect = data.get("_preselected_tariff")
+        if isinstance(preselect, str) and preselect in {"basic", "vip"}:
+            await _send_box_invoice(message, state, preselect)
+        else:
+            await _show_tariffs(message)
 
 
 # ---- Step 7: tariff selection — defers to payment.py ------------------- #
@@ -676,6 +741,42 @@ async def _save_address(message: Message, state: FSMContext, field: str) -> None
 async def _show_tariffs(message: Message) -> None:
     from bot.handlers.payment import show_tariffs  # local import to avoid cycle
     await show_tariffs(message)
+
+
+async def _send_box_invoice(
+    message: Message, state: FSMContext, tariff_value: str
+) -> None:
+    """Skip the manual tariff picker and go straight to invoicing."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    from bot.models import Tariff
+    from bot.services.payments import TARIFF_META, send_invoice
+
+    try:
+        tariff = Tariff(tariff_value)
+    except ValueError:
+        await _show_tariffs(message)
+        return
+    await state.update_data(_tariff=tariff.value)
+    await state.set_state(Onboarding.waiting_payment)
+    sent = await send_invoice(message.bot, message.chat.id, tariff)
+    if not sent:
+        await message.answer(
+            "Платёжный провайдер пока не настроен. Можешь оформить в "
+            "тестовом режиме — нажми кнопку ниже.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=(
+                                f"✅ Оформить за {TARIFF_META[tariff]['price']} ₽ (тест)"
+                            ),
+                            callback_data=f"manualpay:{tariff.value}",
+                        )
+                    ]
+                ]
+            ),
+        )
 
 
 # ---- Helpers ------------------------------------------------------------ #
